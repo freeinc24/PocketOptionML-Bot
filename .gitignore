@@ -1,0 +1,18 @@
+# Credentials and logs
+config.py
+*.csv
+*.log
+*.pkl
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.env
+.venv
+venv/
+ENV/
+
+# IDE
+.vscode/
+.idea/
