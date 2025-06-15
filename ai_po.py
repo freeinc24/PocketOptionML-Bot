@@ -1,8 +1,13 @@
-import time, json, threading, csv, os, random
-from datetime import datetime
+import time
+import json
+import asyncio
+import csv
+import os
+import random
+from datetime import datetime, timedelta
 from collections import deque
-from pocketoptionapi.stable_api import PocketOption
-import pocketoptionapi.global_value as global_value
+from BinaryOptionsToolsV2.pocketoption import PocketOptionAsync
+from BinaryOptionsToolsV2.tracing import start_logs, Logger
 import pandas as pd
 import talib.abstract as ta
 from sklearn.linear_model import LogisticRegression
@@ -10,7 +15,8 @@ import joblib
 from config import SSID, DEMO, MIN_PAYOUT, PERIOD, EXPIRATION
 
 # === GLOBAL CONFIG ===
-global_value.loglevel = 'WARNING'  # Quiet mode
+start_logs(".", "WARNING", terminal=True)  # Initialize logging
+logger = Logger()
 ssid = SSID
 demo = DEMO
 min_payout = MIN_PAYOUT
@@ -20,17 +26,24 @@ TRADE_LOG = "trades_log.csv"
 SMA_LOG = "sma_values.csv"
 MODEL_FILE = "ml_model.pkl"
 
+# === GLOBAL STATE ===
+pairs = {}  # Replace global_value.pairs
+websocket_is_connected = True  # Track connection status
+
 # === INIT API ===
-api = PocketOption(ssid, demo)
-api.connect()
+async def init_api():
+    global api
+    api = PocketOptionAsync(ssid)
+    await asyncio.sleep(5)  # Wait for WebSocket connection
+    return api
 
 # === Load or Init Model ===
 try:
     clf = joblib.load(MODEL_FILE)
-    print("í´– Loaded saved ML model.")
+    logger.info("Loaded saved ML model.")
 except:
     clf = LogisticRegression()
-    print("í´– New model will be trained.")
+    logger.warning("New model will be trained.")
 
 # === LOG TRADE ===
 def log_trade(pair, direction, amount, expiration, last, result=None):
@@ -54,6 +67,7 @@ def log_trade(pair, direction, amount, expiration, last, result=None):
         if not file_exists:
             writer.writeheader()
         writer.writerow(log_data)
+    logger.info(f"Trade logged: {pair}, {direction}, Result: {result}")
 
 # === LOG INDICATORS ===
 def log_sma(pair, last):
@@ -72,45 +86,60 @@ def log_sma(pair, last):
         if not file_exists:
             writer.writeheader()
         writer.writerow(log_data)
+    logger.debug(f"SMA logged: {pair}, SMA12: {last['sma12']}")
 
 # === PAYOUT FILTER ===
-def get_payout():
+async def get_payout():
+    global pairs
     try:
-        d = json.loads(global_value.PayoutData)
-        global_value.pairs = {}
-        for pair in d:
-            if len(pair) == 19 and pair[14] and pair[5] == min_payout and "_otc" in pair[1]:
-                global_value.pairs[pair[1]] = {
-                    'id': pair[0],
-                    'payout': pair[5],
-                    'type': pair[3]
+        payout_data = await api.payout()  # Returns dict of asset:payout
+        pairs = {}
+        for asset, payout in payout_data.items():
+            if payout >= min_payout and "_otc" in asset:
+                pairs[asset] = {
+                    'id': asset,  # Adjust if API provides specific ID
+                    'payout': payout,
+                    'type': 'binary',  # Assume binary for OTC
+                    'history': deque(maxlen=100)
                 }
+        logger.info(f"Payout data loaded: {len(pairs)} pairs with payout >= {min_payout}%")
         return True
     except Exception as e:
-        global_value.logger(f"Failed parsing payout: {e}", "ERROR")
+        logger.error(f"Failed parsing payout: {e}")
         return False
 
 # === HISTORY LOADER ===
-def get_df():
+async def get_df():
     try:
-        for i, pair in enumerate(global_value.pairs):
-            df = api.get_candles(pair, period)
-            if df and isinstance(global_value.pairs[pair].get('history'), deque):
-                for entry in df:
-                    global_value.pairs[pair]['history'].append(entry)
-            time.sleep(1)
+        for pair in pairs:
+            candles = await api.get_candles(pair, period, 3600)  # Fetch 1 hour of candles
+            if candles and isinstance(pairs[pair].get('history'), deque):
+                for candle in candles:
+                    pairs[pair]['history'].append({
+                        'time': candle['time'],
+                        'price': candle['close']  # Adjust if API uses different keys
+                    })
+            await asyncio.sleep(1)  # Avoid rate limits
+        logger.info("Historical data loaded for all pairs")
         return True
     except Exception as e:
-        global_value.logger(f"get_df() error: {e}", "ERROR")
+        logger.error(f"get_df() error: {e}")
         return False
 
 # === ORDER EXECUTION ===
-def buy(amount, pair, action, expiration, last):
-    result = api.buy(amount=amount, active=pair, action=action, expirations=expiration)
-    trade_id = result[1]
-    outcome = api.check_win(trade_id)
-    log_trade(pair, action, amount, expiration, last, outcome)
-    print(f"âœ… TRADE: {pair} | {action.upper()} | Result: {outcome.upper()}")
+async def buy(amount, pair, action, expiration, last):
+    try:
+        if action == "call":
+            (trade_id, trade_data) = await api.buy(asset=pair, amount=amount, time=expiration, check_win=False)
+        else:
+            (trade_id, trade_data) = await api.sell(asset=pair, amount=amount, time=expiration, check_win=False)
+        await asyncio.sleep(expiration + 2)  # Wait for trade to complete
+        outcome = await api.check_win(trade_id)
+        result = outcome.get('result', 'unknown')
+        log_trade(pair, action, amount, expiration, last, result)
+        logger.info(f"TRADE: {pair} | {action.upper()} | Result: {result.upper()}")
+    except Exception as e:
+        logger.error(f"Trade failed: {pair}, {action}, Error: {e}")
 
 # === RESAMPLE CANDLES ===
 def make_df(history):
@@ -126,34 +155,35 @@ def make_df(history):
         df = df[df['time'] < datetime.fromtimestamp(wait(False))]
         return df
     except Exception as e:
-        global_value.logger(f"make_df error: {e}", "ERROR")
+        logger.error(f"make_df error: {e}")
         return pd.DataFrame()
 
 # === ROTATING STRATEGY ===
-def rotate_pairs_strategy():
+async def rotate_pairs_strategy():
+    global websocket_is_connected
     while True:
         try:
-            all_pairs = list(global_value.pairs.keys())
+            all_pairs = list(pairs.keys())
             if len(all_pairs) < 5:
-                print("âš ï¸ Not enough 92% payout pairs.")
-                if not reconnect():
+                logger.warning("Not enough 92% payout pairs.")
+                if not await reconnect():
                     return
                 continue
 
             cycle_time = 5 * 60  # 5 min
             random.shuffle(all_pairs)
             watchlist = all_pairs[:5]
-            print(f"\ní´ Watching: {', '.join(watchlist)}")
+            logger.info(f"Watching: {', '.join(watchlist)}")
 
             start_time = time.time()
             trade_count = 0
 
             while time.time() - start_time < cycle_time:
-                if not global_value.websocket_is_connected:
+                if not websocket_is_connected:
                     raise Exception("Websocket connection lost")
-                    
+
                 for pair in watchlist:
-                    history = global_value.pairs[pair].get('history')
+                    history = pairs[pair].get('history')
                     if not history or len(history) < 60:
                         continue
 
@@ -180,13 +210,11 @@ def rotate_pairs_strategy():
                     joblib.dump(clf, MODEL_FILE)
 
                     last = df.iloc[-1]
-                    # Create DataFrame for prediction with named features
                     X_pred = pd.DataFrame([{
                         'sma_diff': last['sma_diff'],
                         'macd_hist': last['macd_hist'],
                         'rsi': last['rsi']
                     }])
-                    
                     ml_prediction = clf.predict(X_pred)[0]
                     last_dict = last.to_dict()
                     log_sma(pair, last_dict)
@@ -198,77 +226,78 @@ def rotate_pairs_strategy():
                         signal_type = "put"
 
                     if signal_type == "call" and ml_prediction == 1:
-                        print(f"íº€ CALL on {pair}")
-                        threading.Thread(target=buy, args=(100, pair, "call", expiration, last_dict)).start()
+                        logger.info(f"CALL on {pair}")
+                        await buy(100, pair, "call", expiration, last_dict)
                         trade_count += 1
                     elif signal_type == "put" and ml_prediction == 0:
-                        print(f"íº€ PUT on {pair}")
-                        threading.Thread(target=buy, args=(100, pair, "put", expiration, last_dict)).start()
+                        logger.info(f"PUT on {pair}")
+                        await buy(100, pair, "put", expiration, last_dict)
                         trade_count += 1
 
-                wait(sleep=True)
+                await wait(sleep=True)
 
-            print(f"â±ï¸ Cycle done â€” trades placed: {trade_count}")
-                
+            logger.info(f"Cycle done â€” trades placed: {trade_count}")
+
         except Exception as e:
-            print(f"âŒ Strategy error: {e}")
-            if not reconnect():
+            logger.error(f"Strategy error: {e}")
+            if not await reconnect():
                 return
             continue
 
 # === PREP + INIT ===
-def prepare():
-    ok = get_payout()
+async def prepare():
+    ok = await get_payout()
     if not ok:
         return False
-    for pair in global_value.pairs:
-        global_value.pairs[pair]['history'] = deque(maxlen=100)
-    return get_df()
+    return await get_df()
 
-def wait(sleep=True):
+async def wait(sleep=True):
     dt = int(datetime.now().timestamp()) - datetime.now().second
     dt += 60
     if sleep:
-        time.sleep(dt - int(datetime.now().timestamp()))
+        await asyncio.sleep(dt - int(datetime.now().timestamp()))
     return dt
 
-def reconnect():
+async def reconnect():
     """Attempt to reconnect to PocketOption API"""
-    global api
+    global api, websocket_is_connected
     max_retries = 3
     retry_count = 0
-    
+
     while retry_count < max_retries:
         try:
-            print(f"í´„ Reconnecting (attempt {retry_count + 1}/{max_retries})...")
-            api = PocketOption(ssid, demo)
-            api.connect()
-            time.sleep(2)
-            if global_value.websocket_is_connected:
-                print("âœ… Reconnected successfully")
-                return True
+            logger.info(f"Reconnecting (attempt {retry_count + 1}/{max_retries})...")
+            api = await init_api()
+            balance = await api.balance()
+            websocket_is_connected = True
+            logger.info(f"Reconnected successfully. Balance: {balance}")
+            return True
         except Exception as e:
-            print(f"âŒ Reconnection failed: {e}")
+            logger.error(f"Reconnection failed: {e}")
+            websocket_is_connected = False
             retry_count += 1
-            time.sleep(5)
+            await asyncio.sleep(5)
     return False
 
-def start():
-    while not global_value.websocket_is_connected:
-        time.sleep(0.1)
-    time.sleep(2)
-    
+async def start():
+    global api
+    api = await init_api()
+    while not websocket_is_connected:
+        await asyncio.sleep(0.1)
+    await asyncio.sleep(2)
+
     while True:
         try:
-            print(f"í²° Balance: {api.get_balance()}")
-            if prepare():
-                rotate_pairs_strategy()
+            balance = await api.balance()
+            logger.info(f"Balance: {balance}")
+            if await prepare():
+                await rotate_pairs_strategy()
         except Exception as e:
-            print(f"âŒ Error in main loop: {e}")
-            if not reconnect():
-                print("í»‘ Max reconnection attempts reached. Exiting...")
+            logger.error(f"Error in main loop: {e}")
+            if not await reconnect():
+                logger.error("Max reconnection attempts reached. Exiting...")
                 break
             continue
 
 if __name__ == "__main__":
-    start()
+    asyncio.run(start())
