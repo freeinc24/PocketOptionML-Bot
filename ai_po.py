@@ -4,6 +4,7 @@ import asyncio
 import csv
 import os
 import random
+import traceback
 from datetime import datetime, timedelta
 from collections import deque
 from BinaryOptionsToolsV2.pocketoption import PocketOptionAsync
@@ -12,7 +13,15 @@ import pandas as pd
 import talib.abstract as ta
 from sklearn.linear_model import LogisticRegression
 import joblib
-from config import SSID, DEMO, MIN_PAYOUT, PERIOD, EXPIRATION
+from config import SSID, DEMO, MIN_PAYOUT, PERIOD, EXPIRATION, TRADE_AMOUNT
+
+# === CONFIG VALIDATION ===
+def validate_config():
+    assert 0 < MIN_PAYOUT <= 100, "MIN_PAYOUT must be between 0 and 100"
+    assert PERIOD in [60, 300], "PERIOD must be 60 or 300"
+    # Add more as needed
+
+validate_config()
 
 # === GLOBAL CONFIG ===
 start_logs(".", "WARNING", terminal=True)  # Initialize logging
@@ -26,10 +35,26 @@ TRADE_LOG = "trades_log.csv"
 SMA_LOG = "sma_values.csv"
 MODEL_FILE = "ml_model.pkl"
 
+CYCLE_TIME = 5 * 60  # 5 minutes
+MIN_HISTORY_LENGTH = 60
+MIN_DF_LENGTH = 40
+MODEL_TRAIN_INTERVAL = 60 * 10  # 10 minutes
+
 # === GLOBAL STATE ===
 pairs = {}  # Replace global_value.pairs
 websocket_is_connected = True  # Track connection status
+last_model_train_time = None
 
+if not hasattr(logger, "warning"):
+    logger.warning = logger.warn
+class Logger:
+    def warn(self, *args, **kwargs):
+        # Your existing warning logic here
+        print("[WARN]", *args)
+
+    def warning(self, *args, **kwargs):
+        # Alias for warn()
+        return self.warn(*args, **kwargs)
 # === INIT API ===
 async def init_api():
     global api
@@ -41,12 +66,15 @@ async def init_api():
 try:
     clf = joblib.load(MODEL_FILE)
     logger.info("Loaded saved ML model.")
-except:
+except FileNotFoundError:
     clf = LogisticRegression()
     logger.warning("New model will be trained.")
+except Exception as e:
+    logger.error(f"Error loading model: {e}\n{traceback.format_exc()}")
+    clf = LogisticRegression()
 
 # === LOG TRADE ===
-def log_trade(pair, direction, amount, expiration, last, result=None):
+def log_trade(pair: str, direction: str, amount: float, expiration: int, last: dict, result: str = None) -> None:
     log_data = {
         "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
         "pair": pair,
@@ -70,7 +98,7 @@ def log_trade(pair, direction, amount, expiration, last, result=None):
     logger.info(f"Trade logged: {pair}, {direction}, Result: {result}")
 
 # === LOG INDICATORS ===
-def log_sma(pair, last):
+def log_sma(pair: str, last: dict) -> None:
     log_data = {
         "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
         "pair": pair,
@@ -92,7 +120,7 @@ def log_sma(pair, last):
 async def get_payout():
     global pairs
     try:
-        payout_data = await api.payout()  # Returns dict of asset:payout
+        payout_data = await asyncio.wait_for(api.payout(), timeout=10)  # Returns dict of asset:payout
         pairs = {}
         for asset, payout in payout_data.items():
             if payout >= min_payout and "_otc" in asset:
@@ -104,6 +132,9 @@ async def get_payout():
                 }
         logger.info(f"Payout data loaded: {len(pairs)} pairs with payout >= {min_payout}%")
         return True
+    except asyncio.TimeoutError:
+        logger.error("Timeout while fetching payout data.")
+        return False
     except Exception as e:
         logger.error(f"Failed parsing payout: {e}")
         return False
@@ -127,7 +158,7 @@ async def get_df():
         return False
 
 # === ORDER EXECUTION ===
-async def buy(amount, pair, action, expiration, last):
+async def buy(amount: float, pair: str, action: str, expiration: int, last: dict):
     try:
         if action == "call":
             (trade_id, trade_data) = await api.buy(asset=pair, amount=amount, time=expiration, check_win=False)
@@ -152,7 +183,8 @@ def make_df(history):
         df.set_index('time', inplace=True)
         df = df['price'].resample(f'{period}s').ohlc()
         df.reset_index(inplace=True)
-        df = df[df['time'] < datetime.fromtimestamp(wait(False))]
+        # Remove future data
+        df = df[df['time'] < datetime.now()]
         return df
     except Exception as e:
         logger.error(f"make_df error: {e}")
@@ -160,7 +192,7 @@ def make_df(history):
 
 # === ROTATING STRATEGY ===
 async def rotate_pairs_strategy():
-    global websocket_is_connected
+    global websocket_is_connected, last_model_train_time, clf
     while True:
         try:
             all_pairs = list(pairs.keys())
@@ -170,7 +202,6 @@ async def rotate_pairs_strategy():
                     return
                 continue
 
-            cycle_time = 5 * 60  # 5 min
             random.shuffle(all_pairs)
             watchlist = all_pairs[:5]
             logger.info(f"Watching: {', '.join(watchlist)}")
@@ -178,17 +209,17 @@ async def rotate_pairs_strategy():
             start_time = time.time()
             trade_count = 0
 
-            while time.time() - start_time < cycle_time:
+            while time.time() - start_time < CYCLE_TIME:
                 if not websocket_is_connected:
                     raise Exception("Websocket connection lost")
 
                 for pair in watchlist:
                     history = pairs[pair].get('history')
-                    if not history or len(history) < 60:
+                    if not history or len(history) < MIN_HISTORY_LENGTH:
                         continue
 
                     df = make_df(history)
-                    if df.empty or len(df) < 40:
+                    if df.empty or len(df) < MIN_DF_LENGTH:
                         continue
 
                     df['sma12'] = ta.SMA(df['close'], timeperiod=12)
@@ -198,7 +229,7 @@ async def rotate_pairs_strategy():
                     df['sma_diff'] = df['sma12'] - df['sma26']
                     df['macd_hist'] = df['macd'] - df['macdsignal']
                     df['target'] = (df['close'].shift(-1) > df['close']).astype(int)
-                    df.dropna(inplace=True)
+                    df.dropna(subset=['sma12', 'sma26', 'macd', 'macdsignal', 'rsi', 'sma_diff', 'macd_hist', 'target'], inplace=True)
 
                     features = ['sma_diff', 'macd_hist', 'rsi']
                     X = df[features]
@@ -206,8 +237,11 @@ async def rotate_pairs_strategy():
                     if len(X) < 30:
                         continue
 
-                    clf.fit(X[:-1], y[:-1])
-                    joblib.dump(clf, MODEL_FILE)
+                    now = time.time()
+                    if last_model_train_time is None or now - last_model_train_time > MODEL_TRAIN_INTERVAL:
+                        clf.fit(X[:-1], y[:-1])
+                        joblib.dump(clf, MODEL_FILE)
+                        last_model_train_time = now
 
                     last = df.iloc[-1]
                     X_pred = pd.DataFrame([{
@@ -227,11 +261,11 @@ async def rotate_pairs_strategy():
 
                     if signal_type == "call" and ml_prediction == 1:
                         logger.info(f"CALL on {pair}")
-                        await buy(100, pair, "call", expiration, last_dict)
+                        await buy(TRADE_AMOUNT, pair, "call", expiration, last_dict)
                         trade_count += 1
                     elif signal_type == "put" and ml_prediction == 0:
                         logger.info(f"PUT on {pair}")
-                        await buy(100, pair, "put", expiration, last_dict)
+                        await buy(TRADE_AMOUNT, pair, "put", expiration, last_dict)
                         trade_count += 1
 
                 await wait(sleep=True)
@@ -300,4 +334,15 @@ async def start():
             continue
 
 if __name__ == "__main__":
-    asyncio.run(start())
+    try:
+        asyncio.run(start())
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user.")
+class Logger:
+    def warn(self, *args, **kwargs):
+        # Your existing warning logic here
+        print("[WARN]", *args)
+
+    def warning(self, *args, **kwargs):
+        # Alias for warn()
+        return self.warn(*args, **kwargs)
